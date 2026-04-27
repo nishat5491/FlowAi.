@@ -1,0 +1,295 @@
+from flask import Flask, request, jsonify, session, redirect
+import requests, os, time, html, sqlite3
+from collections import defaultdict
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY","flowai_secret")
+
+API_KEY = os.environ.get("API_KEY")
+APP_TOKEN = os.environ.get("APP_TOKEN","flowai_secure")
+
+# ================= DB =================
+def init_db():
+    conn = sqlite3.connect("flowai.db")
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS users (username TEXT, password TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS chats (user TEXT, message TEXT, reply TEXT)")
+    conn.commit()
+    conn.close()
+init_db()
+
+# ================= RATE LIMIT =================
+req_log = defaultdict(list)
+def limit(ip):
+    now=time.time()
+    req_log[ip]=[t for t in req_log[ip] if now-t<10]
+    if len(req_log[ip])>10: return True
+    req_log[ip].append(now)
+    return False
+
+# ================= LOGIN =================
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if request.method=="POST":
+        u=request.form.get("username")
+        p=request.form.get("password")
+
+        conn=sqlite3.connect("flowai.db")
+        c=conn.cursor()
+        c.execute("SELECT * FROM users WHERE username=?", (u,))
+        user=c.fetchone()
+
+        if not user:
+            c.execute("INSERT INTO users VALUES (?,?)",(u,p))
+            conn.commit()
+            session["user"]=u
+            return redirect("/")
+
+        if user[1]==p:
+            session["user"]=u
+            return redirect("/")
+
+        return "Wrong password"
+
+    return """
+    <h2>FlowAi Login</h2>
+    <form method="post">
+    <input name="username" placeholder="Username"><br><br>
+    <input name="password" type="password" placeholder="Password"><br><br>
+    <button>Login</button>
+    </form>
+    """
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+# ================= UI =================
+@app.route("/")
+def home():
+    if "user" not in session:
+        return redirect("/login")
+
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>FlowAi</title>
+
+<style>
+:root {{
+--bg:#050505;
+--glass:rgba(255,255,255,0.05);
+--border:rgba(255,255,255,0.08);
+--gold:#FFD700;
+--purple:#7a3cff;
+}}
+
+body {{
+margin:0;
+font-family:Segoe UI;
+background: radial-gradient(circle at 30% 20%, #2a0d5f, transparent),
+            radial-gradient(circle at 80% 80%, #0a3d2e, transparent),
+            var(--bg);
+color:white;
+}}
+
+.sidebar {{
+position:fixed;
+width:230px;height:100%;
+padding:20px;
+backdrop-filter:blur(20px);
+background:var(--glass);
+border-right:1px solid var(--border);
+}}
+
+.logo {{
+text-align:center;margin-bottom:30px;
+}}
+
+.logo-circle {{
+width:70px;height:70px;margin:auto;
+border-radius:50%;
+background:conic-gradient(var(--purple),var(--gold));
+display:flex;align-items:center;justify-content:center;
+font-size:28px;font-weight:bold;color:black;
+box-shadow:0 0 30px rgba(122,60,255,0.6);
+animation:spin 6s linear infinite;
+}}
+
+@keyframes spin {{to{{transform:rotate(360deg)}}}}
+
+.nav-btn {{
+width:100%;padding:12px;margin:8px 0;
+border:none;border-radius:10px;
+background:transparent;color:#aaa;
+cursor:pointer;transition:.3s;
+}}
+
+.nav-btn:hover {{
+color:white;background:rgba(255,255,255,0.05);
+transform:translateX(5px);
+}}
+
+.main {{
+margin-left:230px;padding:25px;
+}}
+
+#chat {{
+height:420px;
+overflow:auto;
+padding:15px;
+border-radius:15px;
+background:var(--glass);
+border:1px solid var(--border);
+}}
+
+.msg {{
+margin:10px;padding:12px;
+border-radius:12px;
+max-width:70%;
+animation:fade .3s;
+}}
+
+@keyframes fade {{from{{opacity:0}}to{{opacity:1}}}}
+
+.user {{
+margin-left:auto;
+background:linear-gradient(135deg,var(--gold),#ffb700);
+color:black;
+}}
+
+.ai {{
+background:rgba(255,255,255,0.05);
+}}
+
+.input {{
+display:flex;margin-top:15px;gap:10px;
+}}
+
+input {{
+flex:1;padding:12px;border-radius:20px;
+border:none;background:var(--glass);color:white;
+}}
+
+.send {{
+padding:12px 20px;border:none;border-radius:20px;
+background:linear-gradient(135deg,var(--purple),var(--gold));
+cursor:pointer;
+}}
+
+.loader {{
+border:3px solid #333;
+border-top:3px solid gold;
+border-radius:50%;
+width:20px;height:20px;
+animation:spin 1s linear infinite;
+}}
+</style>
+</head>
+
+<body>
+
+<div class="sidebar">
+<div class="logo">
+<div class="logo-circle">F</div>
+<h3>FlowAi</h3>
+<p>👤 {session['user']}</p>
+</div>
+
+<button class="nav-btn" onclick="setMode('chat')">Chat</button>
+<button class="nav-btn" onclick="setMode('code')">Code</button>
+<button class="nav-btn" onclick="setMode('search')">Search</button>
+<button class="nav-btn" onclick="logout()">Logout</button>
+</div>
+
+<div class="main">
+<h2>FlowAi SaaS</h2>
+
+<div id="chat"></div>
+
+<div class="input">
+<input id="msg" placeholder="Ask anything..." onkeypress="if(event.key==='Enter')send()">
+<button class="send" onclick="send()">Send</button>
+</div>
+</div>
+
+<script>
+let mode="chat";
+
+function logout(){{window.location="/logout"}}
+
+function esc(t){{let d=document.createElement("div");d.textContent=t;return d.innerHTML}}
+
+async function send(){{
+let t=msg.value;
+if(!t)return;
+
+chat.innerHTML+=`<div class="msg user">${{esc(t)}}</div>`;
+chat.innerHTML+=`<div class="msg ai"><span class="loader"></span></div>`;
+
+let r=await fetch("/api/chat",{{
+method:"POST",
+headers:{{"Content-Type":"application/json"}},
+body:JSON.stringify({{message:t,mode:mode}})
+}});
+
+let d=await r.json();
+
+chat.innerHTML=chat.innerHTML.replace('<span class="loader"></span>',esc(d.reply));
+msg.value="";
+chat.scrollTop=chat.scrollHeight;
+}}
+</script>
+
+</body>
+</html>
+"""
+
+# ================= CHAT =================
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    if "user" not in session:
+        return jsonify({"reply":"Login required"}),403
+
+    if limit(request.remote_addr):
+        return jsonify({"reply":"Too many requests"}),429
+
+    data=request.json
+    msg=data.get("message","")
+    mode=data.get("mode","chat")
+
+    system="Helpful AI"
+    if mode=="code": system="Coding expert"
+    if mode=="search": system="Short answer"
+
+    try:
+        res=requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization":f"Bearer {API_KEY}"},
+            json={
+                "model":"gpt-4o-mini",
+                "messages":[
+                    {"role":"system","content":system},
+                    {"role":"user","content":msg}
+                ]
+            }
+        )
+        reply=res.json()["choices"][0]["message"]["content"]
+    except:
+        reply="Error"
+
+    # save chat
+    conn=sqlite3.connect("flowai.db")
+    c=conn.cursor()
+    c.execute("INSERT INTO chats VALUES (?,?,?)",(session["user"],msg,reply))
+    conn.commit()
+    conn.close()
+
+    return jsonify({"reply":html.escape(reply)})
+
+# ================= RUN =================
+if __name__=="__main__":
+    app.run(host="0.0.0.0", po
